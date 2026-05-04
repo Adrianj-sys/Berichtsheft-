@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Module 2.2: PDF downloader with report number parameter.
+Usage: python download_pdf.py           # latest report
+       python download_pdf.py 136       # single report
+       python download_pdf.py 1 141     # range (1 to 141)
+"""
+
+import re
+import sys
+import logging
+import pickle
+from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+BASE_URL = "https://www.azubiheft.de"
+LOGIN_URL = f"{BASE_URL}/Login.aspx"
+OVERVIEW_URL = f"{BASE_URL}/Azubi/Ausbildungsnachweise.aspx"
+DOWNLOAD_DIR = Path(__file__).parent.parent / "downloads"
+COOKIE_FILE = Path(__file__).parent.parent / "auth" / "session.pkl"
+
+USERNAME = os.getenv("WEBSITE_USERNAME")
+PASSWORD = os.getenv("WEBSITE_PASSWORD")
+
+
+def login_if_needed():
+    if COOKIE_FILE.exists():
+        return True
+    
+    session = requests.Session()
+    resp = session.get(LOGIN_URL, timeout=15)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    
+    payload = {
+        "__VIEWSTATE": soup.find("input", {"name": "__VIEWSTATE"})["value"],
+        "__VIEWSTATEGENERATOR": soup.find("input", {"name": "__VIEWSTATEGENERATOR"})["value"],
+        "__EVENTVALIDATION": soup.find("input", {"name": "__EVENTVALIDATION"})["value"],
+        "ctl00$ContentPlaceHolder1$txt_Benutzername": USERNAME,
+        "ctl00$ContentPlaceHolder1$txt_Passwort": PASSWORD,
+        "ctl00$ContentPlaceHolder1$cmd_Login": "Anmelden",
+    }
+    
+    resp = session.post(LOGIN_URL, data=payload, timeout=15)
+    
+    if "Default.aspx" in resp.url:
+        logger.info("Login successful")
+        COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(COOKIE_FILE, "wb") as f:
+            pickle.dump(session.cookies, f)
+        return True
+    
+    logger.error("Login failed")
+    return False
+
+
+def get_latest_report_number():
+    with open(COOKIE_FILE, "rb") as f:
+        cookies = pickle.load(f)
+    
+    session = requests.Session()
+    session.cookies.update(cookies)
+    resp = session.get(OVERVIEW_URL, timeout=15)
+    numbers = re.findall(r"NachweisNr=(\d+)", resp.text)
+    
+    return max(int(n) for n in numbers) if numbers else None
+
+
+def get_report_numbers():
+    """Figure out which reports to download based on arguments."""
+    if len(sys.argv) == 1:
+        # No args: latest only
+        latest = get_latest_report_number()
+        return [latest] if latest else []
+    
+    elif len(sys.argv) == 2:
+        # One arg: single report
+        return [int(sys.argv[1])]
+    
+    elif len(sys.argv) == 3:
+        # Two args: range from-to
+        start = int(sys.argv[1])
+        end = int(sys.argv[2])
+        return list(range(start, end + 1))
+    
+    else:
+        print("Usage: python download_pdf.py [report_number] [end_number]")
+        return []
+
+
+def download_report(report_number, page):
+    """Download a single report by number."""
+    url = f"{BASE_URL}/Azubi/Wochenansicht.aspx?NachweisNr={report_number}"
+    logger.info(f"  Opening report {report_number}...")
+    page.goto(url, wait_until="networkidle", timeout=15000)
+    
+    filepath = DOWNLOAD_DIR / f"report_{report_number}.pdf"
+    if filepath.exists():
+        logger.info(f"  Already exists, skipping: {filepath.name}")
+        return True
+    
+    logger.info(f"  Click the download button. Press Enter after download starts...")
+    
+    try:
+        with page.expect_download(timeout=120000) as download_info:
+            input("  > ")
+        download_info.value.save_as(str(filepath))
+        logger.info(f"  Saved: {filepath.name}")
+        return True
+    except Exception as e:
+        logger.error(f"  Failed: {e}")
+        return False
+
+
+def main():
+    if not login_if_needed():
+        return
+    
+    numbers = get_report_numbers()
+    if not numbers:
+        logger.error("No reports to download")
+        return
+    
+    logger.info(f"Downloading {len(numbers)} report(s): {numbers[0]} to {numbers[-1]}")
+    
+    with open(COOKIE_FILE, "rb") as f:
+        cookies = pickle.load(f)
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context(accept_downloads=True)
+        page = context.new_page()
+        
+        # Inject cookies once
+        page.goto(BASE_URL, wait_until="domcontentloaded")
+        for cookie in cookies:
+            page.context.add_cookies([{
+                "name": cookie.name,
+                "value": cookie.value,
+                "domain": ".azubiheft.de",
+                "path": "/"
+            }])
+        
+        success = 0
+        for num in numbers:
+            if download_report(num, page):
+                success += 1
+        
+        logger.info(f"Done: {success}/{len(numbers)} downloaded")
+        browser.close()
+
+
+if __name__ == "__main__":
+    main()
