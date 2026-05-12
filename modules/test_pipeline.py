@@ -19,6 +19,11 @@ NKG Nebelkammer Schublade Verdrahtung verbessert
 NKG Nebelkammer Kühler angeschlossen
 NKG Nebelkammer 3D Druckteile gedruckt
 Berichtsheft geschrieben
+
+Dienstag 8:00
+Bohrmaschine der BNB mit temporärer Zuleitung ausgestattet
+Bohrmaschine auf Funktion geprüft
+Feste Zuleitung der Bohrmaschine gezogen und angeschlossen
 """
 
 print("=== Step 2.4: Gemini Prediction ===")
