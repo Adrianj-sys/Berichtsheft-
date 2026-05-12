@@ -7,7 +7,7 @@ from pathlib import Path
 import fitz
 from parse_pdf import parse_pdf, DOWNLOADS_DIR
 from predict_activities import predict
-from telegram_confirm import run_confirmation
+from telegram_confirm import run_confirmation, run_quality_check, run_custom_entry
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +44,7 @@ def get_processed_weeks():
 
 
 def get_unprocessed_pdfs():
-    """Find PDFs that haven't been fully processed yet."""
+    """Find PDFs that haven't been fully processed yet, sorted by completeness."""
     processed_weeks = get_processed_weeks()
     pdfs = sorted(DOWNLOADS_DIR.glob("report_*.pdf"))
     unprocessed = []
@@ -56,6 +56,11 @@ def get_unprocessed_pdfs():
         if bericht["week"] not in processed_weeks:
             unprocessed.append((pdf, bericht))
     
+    # Sort by total hours descending — complete weeks first
+    def get_total(entry):
+        return sum(d["total_hours"] for d in entry[1]["days"].values())
+    
+    unprocessed.sort(key=get_total, reverse=True)
     return unprocessed
 
 
@@ -98,7 +103,9 @@ def process_report(pdf_path, bericht):
     store_existing_activities(bericht)
     
     if not empty_days:
-        logger.info(f"Week {week} is fully complete. No AI needed.")
+        logger.info(f"Week {week} is fully complete.")
+        # Run quality check on auto-approved entries
+        run_quality_check(week)
         return
     
     logger.info(f"Days needing AI: {empty_days}")
@@ -114,8 +121,6 @@ def process_report(pdf_path, bericht):
             for a in existing["activities"]:
                 partial_info += f"  BEHALTEN: {a['task']} ({a['hours']}h)\n"
     
-    logger.info(f"PARTIAL INFO: {partial_info if partial_info else 'None'}")
-    
     doc = fitz.open(str(pdf_path))
     pdf_text = ""
     for page in doc:
@@ -129,6 +134,8 @@ def process_report(pdf_path, bericht):
     if result:
         logger.info(f"Predictions ready for week {week}")
         run_confirmation()
+        # After confirmation, run quality check
+        run_quality_check(week)
     else:
         logger.error(f"Prediction failed for week {week}")
 
@@ -141,7 +148,11 @@ def run():
         logger.info("No unprocessed PDFs found")
         return
     
-    logger.info(f"Found {len(unprocessed)} unprocessed PDFs")
+    # Log the processing order
+    logger.info(f"Found {len(unprocessed)} unprocessed PDFs. Processing order:")
+    for i, (pdf, bericht) in enumerate(unprocessed, 1):
+        total = sum(d["total_hours"] for d in bericht["days"].values())
+        logger.info(f"  {i}. Report {bericht['report_nr']}, Week {bericht['week']}: {total}h")
     
     for pdf_path, bericht in unprocessed:
         logger.info(f"Processing {pdf_path.name}...")
