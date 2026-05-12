@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Module 2.5: Telegram confirmation, quality check, skip week, redo day, custom entry, summary."""
+"""Module 2.5: Telegram confirmation, quality check, skip week, redo day, custom entry, summary, batch regeneration."""
 
 import json
 import os
 import logging
 import sqlite3
 import time
+from collections import defaultdict
 from pathlib import Path
 import requests
 from dotenv import load_dotenv
@@ -83,10 +84,6 @@ def check_responses():
         callback = update.get("callback_query")
         if callback:
             results.append((callback["data"], callback))
-        message = update.get("message")
-        if message and message.get("text"):
-            # This is a text message — handle custom entries
-            pass
     
     return results
 
@@ -115,33 +112,51 @@ def process_actions(actions, current_day_pids):
             
         elif action_str.startswith("redo_"):
             day = action_str.replace("redo_", "")
-            conn.execute("DELETE FROM predictions WHERE status='pending' AND day=?", (day,))
-            conn.execute("UPDATE predictions SET status='rejected' WHERE status='approved' AND day=? AND week=(SELECT MAX(week) FROM predictions)", (day,))
-            logger.info(f"Redoing entire day: {day}")
-            new_text = original_text + f"\n\n🔄 {day} wird neu generiert..."
+            week_row = conn.execute(
+                "SELECT DISTINCT week FROM predictions WHERE day=? AND status IN ('pending','approved') LIMIT 1",
+                (day,)
+            ).fetchone()
+            if week_row:
+                week = week_row[0]
+                conn.execute("DELETE FROM predictions WHERE day=? AND week=?", (day, week))
+                conn.execute(
+                    "INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, (SELECT department FROM predictions WHERE week=? LIMIT 1), ?, 'Neu generieren', 0.0, 'pending')",
+                    (week, week, day)
+                )
+                logger.info(f"Redoing entire day: Week {week}, {day}")
+                new_text = original_text + f"\n\n🔄 {day} wird komplett neu generiert..."
             
         elif action_str.startswith("skip_week_"):
             week = int(action_str.replace("skip_week_", ""))
-            conn.execute("DELETE FROM predictions WHERE week=? AND status='pending'", (week,))
-            conn.execute("INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, 'Skipped', 'Montag', 'Skipped', 8.0, 'approved')", (week,))
-            conn.execute("INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, 'Skipped', 'Dienstag', 'Skipped', 8.0, 'approved')", (week,))
-            conn.execute("INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, 'Skipped', 'Mittwoch', 'Skipped', 8.0, 'approved')", (week,))
-            conn.execute("INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, 'Skipped', 'Donnerstag', 'Skipped', 8.0, 'approved')", (week,))
-            conn.execute("INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, 'Skipped', 'Freitag', 'Skipped', 5.5, 'approved')", (week,))
+            conn.execute("DELETE FROM predictions WHERE week=?", (week,))
+            for d in DAY_ORDER:
+                target = 5.5 if d == "Freitag" else 8.0
+                conn.execute(
+                    "INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, 'Skipped', ?, 'Skipped', ?, 'approved')",
+                    (week, d, target)
+                )
             logger.info(f"Week {week} skipped")
             new_text = original_text + f"\n\n⏭️ Woche {week} uebersprungen"
             
-        elif action_str.startswith("ok_") or action_str.startswith("no_"):
-            action, pid = action_str.split("_", 1)
-            pid = int(pid)
-            if action == "ok":
+        elif action_str.startswith("corr_accept_all"):
+            for pid in current_day_pids:
                 conn.execute("UPDATE predictions SET status='approved' WHERE id=?", (pid,))
-                logger.info(f"Approved: {pid}")
-                new_text = original_text.replace("✅", "✅ ", 1) + "\n✅ Genehmigt"
-            elif action == "no":
-                conn.execute("UPDATE predictions SET status='rejected' WHERE id=?", (pid,))
-                logger.info(f"Rejected: {pid}")
-                new_text = original_text.replace("❌", "❌ ", 1) + "\n❌ Abgelehnt"
+            logger.info("All corrections accepted")
+            new_text = original_text + "\n\n✅ Alle Korrekturen übernommen"
+            
+        elif "_" in action_str and not action_str.startswith("skip_") and not action_str.startswith("redo_") and not action_str.startswith("corr_"):
+            parts = action_str.split("_", 1)
+            if len(parts) == 2:
+                action, pid = parts
+                pid = int(pid)
+                if action == "ok":
+                    conn.execute("UPDATE predictions SET status='approved' WHERE id=?", (pid,))
+                    logger.info(f"Approved: {pid}")
+                    new_text = original_text + "\n✅ Genehmigt"
+                elif action == "no":
+                    conn.execute("UPDATE predictions SET status='rejected' WHERE id=?", (pid,))
+                    logger.info(f"Rejected: {pid}")
+                    new_text = original_text + "\n❌ Abgelehnt"
         
         requests.post(f"{API_URL}/editMessageText", json={
             "chat_id": chat_id, "message_id": message_id,
@@ -180,6 +195,31 @@ def send_day(day, items):
         "reply_markup": json.dumps(keyboard)
     }, timeout=10)
     logger.info(f"Sent day: {day} ({len(items)} entries)")
+
+
+def send_day_batch(day, items):
+    """Send multiple replacement entries for a day in one message."""
+    week = items[0][1]
+    lines = [f"<b>Ersatz — Woche {week}, {day}</b>\n"]
+    for pid, w, d, dy, task, hours in items:
+        lines.append(f"• {task} <i>({hours}h)</i>")
+    text = "\n".join(lines)
+    
+    keyboard = {"inline_keyboard": []}
+    for pid, w, d, dy, task, hours in items:
+        keyboard["inline_keyboard"].append([
+            {"text": f"✅ {task[:30]}...", "callback_data": f"ok_{pid}"},
+            {"text": "❌", "callback_data": f"no_{pid}"},
+        ])
+    keyboard["inline_keyboard"].append([
+        {"text": "✅ ALLE genehmigen", "callback_data": f"dayok_{items[0][0]}"},
+    ])
+    
+    requests.post(f"{API_URL}/sendMessage", json={
+        "chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+        "reply_markup": json.dumps(keyboard)
+    }, timeout=10)
+    logger.info(f"Sent replacements batch: {day} ({len(items)} entries)")
 
 
 def send_single(pid, week, day, task, hours):
@@ -229,18 +269,19 @@ def handle_rejection(pid):
         conn.close()
         
         logger.info(f"Generated replacement {new_id} for rejected {pid}")
-        send_single(new_id, week, day, new_task, new_hours)
-        return new_id
+        return new_id, week, day, new_task, new_hours
     else:
         conn.close()
         logger.error(f"Failed to generate replacement for {pid}")
         return None
 
 
+# ========== MAIN CONFIRMATION FLOW ==========
+
 def run_confirmation():
     logger.info("Starting confirmation...")
     
-    # Send skip week button for the first pending week
+    # Skip week button
     conn = sqlite3.connect(str(DB_PATH))
     first_week = conn.execute(
         "SELECT DISTINCT week FROM predictions WHERE status='pending' ORDER BY week LIMIT 1"
@@ -270,7 +311,7 @@ def run_confirmation():
     
     clear_update_queue()
     
-    # Initial pass
+    # Initial pass: send all days
     while True:
         day, items = get_next_day()
         if not items:
@@ -293,25 +334,46 @@ def run_confirmation():
     
     logger.info("Initial pass complete")
     
-    # Handle rejections
+    # Handle rejections — batch by day
     while True:
         conn = sqlite3.connect(str(DB_PATH))
         rejected = conn.execute(
-            "SELECT id, week, day, task, hours FROM predictions WHERE status='rejected' ORDER BY id LIMIT 1"
-        ).fetchone()
+            "SELECT id, week, day, task, hours FROM predictions WHERE status='rejected' ORDER BY day, id"
+        ).fetchall()
         conn.close()
         
         if not rejected:
             break
         
-        pid = rejected[0]
-        new_id = handle_rejection(pid)
+        # Group by day
+        by_day = defaultdict(list)
+        for pid, week, day, task, hours in rejected:
+            by_day[day].append((pid, week, day, task, hours))
         
-        if new_id:
-            logger.info(f"Waiting for response on replacement {new_id}...")
-            actions = wait_for_responses()
-            if actions:
-                process_actions(actions, [new_id])
+        # Handle one day at a time — batch all replacements together
+        for day, entries in by_day.items():
+            logger.info(f"Regenerating {len(entries)} entries for {day}...")
+            send_message(f"🔄 {len(entries)} abgelehnte Einträge für {day} werden neu generiert...")
+            
+            for pid, week, day, task, hours in entries:
+                handle_rejection(pid)
+                time.sleep(0.5)
+            
+            # Send all replacements in one message
+            conn = sqlite3.connect(str(DB_PATH))
+            replacements = conn.execute(
+                "SELECT id, week, day, task, hours FROM predictions WHERE status='pending' AND day=? ORDER BY id",
+                (day,)
+            ).fetchall()
+            conn.close()
+            
+            if replacements:
+                send_day_batch(day, replacements)
+                logger.info(f"Waiting for response on {len(replacements)} replacements for {day}...")
+                actions = wait_for_responses()
+                if actions:
+                    pids = [r[0] for r in replacements]
+                    process_actions(actions, pids)
         
         time.sleep(1)
     
@@ -327,6 +389,8 @@ def run_confirmation():
     send_weekly_summary()
 
 
+# ========== WEEKLY SUMMARY ==========
+
 def send_weekly_summary():
     """Send a summary of all approved entries for the most recent week."""
     conn = sqlite3.connect(str(DB_PATH))
@@ -340,10 +404,13 @@ def send_weekly_summary():
     
     week = week[0]
     rows = conn.execute(
-        "SELECT day, task, hours FROM predictions WHERE status='approved' AND week=? ORDER BY CASE day WHEN 'Montag' THEN 1 WHEN 'Dienstag' THEN 2 WHEN 'Mittwoch' THEN 3 WHEN 'Donnerstag' THEN 4 WHEN 'Freitag' THEN 5 END",
+        "SELECT day, task, hours FROM predictions WHERE status='approved' AND week=? AND task != 'Skipped' ORDER BY CASE day WHEN 'Montag' THEN 1 WHEN 'Dienstag' THEN 2 WHEN 'Mittwoch' THEN 3 WHEN 'Donnerstag' THEN 4 WHEN 'Freitag' THEN 5 END",
         (week,)
     ).fetchall()
     conn.close()
+    
+    if not rows:
+        return
     
     text = f"📋 <b>Wochenübersicht — Woche {week}</b>\n\n"
     current_day = None
@@ -376,7 +443,7 @@ def run_quality_check(week):
     
     conn = sqlite3.connect(str(DB_PATH))
     entries = conn.execute(
-        "SELECT id, day, task FROM predictions WHERE status='approved' AND week=? ORDER BY id",
+        "SELECT id, day, task FROM predictions WHERE status='approved' AND week=? AND task != 'Skipped' ORDER BY id",
         (week,)
     ).fetchall()
     conn.close()
@@ -387,22 +454,19 @@ def run_quality_check(week):
     corrections = []
     
     for pid, day, task in entries:
-        # Simple English detection
-        english_words = ["the", "and", "made", "tested", "built", "fixed", "worked", "cleaned"]
+        english_words = ["the", "and", "made", "tested", "built", "fixed", "worked", "cleaned", "installed", "checked"]
         is_english = any(w in task.lower().split() for w in english_words)
         
         if is_english:
-            # Translate
             from predict_activities import translate_entry
             corrected = translate_entry(task)
             if corrected and corrected != task:
                 corrections.append((pid, week, day, task, corrected, "translation"))
-        
-        # Spell/grammar check
-        from predict_activities import check_spelling
-        corrected = check_spelling(task)
-        if corrected and corrected != task:
-            corrections.append((pid, week, day, task, corrected, "spelling"))
+        else:
+            from predict_activities import check_spelling
+            corrected = check_spelling(task)
+            if corrected and corrected != task:
+                corrections.append((pid, week, day, task, corrected, "spelling"))
     
     if corrections:
         send_corrections_batch(corrections)
@@ -420,12 +484,12 @@ def send_corrections_batch(corrections):
         text += f"<i>Korrektur:</i> {corrected}\n\n"
         
         keyboard["inline_keyboard"].append([
-            {"text": f"✅ {i+1}", "callback_data": f"ok_{pid}"},
-            {"text": f"❌ {i+1}", "callback_data": f"no_{pid}"},
+            {"text": f"✅ Übernehmen", "callback_data": f"ok_{pid}"},
+            {"text": f"❌ Verwerfen", "callback_data": f"no_{pid}"},
         ])
     
     keyboard["inline_keyboard"].append([
-        {"text": "✅ ALLE", "callback_data": "corr_accept_all"}
+        {"text": "✅ ALLE übernehmen", "callback_data": "corr_accept_all"}
     ])
     
     requests.post(f"{API_URL}/sendMessage", json={

@@ -370,6 +370,50 @@ ENGLISH: {text}"""
 
 
 
+
+def check_spelling(text):
+    """Check a single entry for spelling/grammar issues."""
+    prompt = f"""Pruefe diesen Text auf Rechtschreib- und Grammatikfehler.
+Wenn er korrekt ist, antworte mit dem EXAKT gleichen Text.
+Wenn er Fehler hat, korrigiere sie und gib NUR den korrigierten Text zurueck.
+Keine Erklaerung, kein JSON.
+
+TEXT: {text}"""
+    
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
+        )
+        corrected = response.text.strip()
+        if corrected and corrected != text:
+            return corrected
+        return None
+    except:
+        return None
+
+
+def translate_entry(text):
+    """Translate English entry to German."""
+    prompt = f"""Uebersetze diesen englischen Text ins Deutsche.
+Gib NUR die Uebersetzung zurueck, keine Erklaerung.
+
+ENGLISH: {text}"""
+    
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
+        )
+        translated = response.text.strip()
+        if translated and translated != text:
+            return translated
+        return None
+    except:
+        return None
+
+
+
 if __name__ == "__main__":
     sample = """
     Abteilung: Ausbildungszentrum
