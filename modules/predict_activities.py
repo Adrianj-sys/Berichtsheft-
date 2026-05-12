@@ -207,8 +207,8 @@ def predict(pdf_text):
         
         except Exception as e:
             error_str = str(e)
-            if "429" in error_str:
-                logger.warning(f"Rate limited (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
+            if "429" in error_str or "503" in error_str:
+                logger.warning(f"API error (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:
@@ -251,6 +251,7 @@ NICHT VORSCHLAGEN:
 {rejected_text}
 
 Schlage EINE NEUE Taetigkeit vor, die {hours}h dauert und zum Tag {day} passt.
+Schreibe NUR die Taetigkeit, nicht den Tag oder die Stundenzahl.
 
 Antworte NUR mit JSON:
 {{"task": "Neue Taetigkeit", "hours": {hours}}}"""
@@ -275,8 +276,8 @@ Antworte NUR mit JSON:
         
         except Exception as e:
             error_str = str(e)
-            if "429" in error_str:
-                logger.warning(f"Rate limited (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
+            if "429" in error_str or "503" in error_str:
+                logger.warning(f"API error (attempt {attempt+1}/{max_retries}). Retrying in {retry_delay}s...")
                 time.sleep(retry_delay)
                 retry_delay *= 2
             else:

@@ -91,7 +91,21 @@ def send_message(text):
     requests.post(f"{API_URL}/sendMessage", json={"chat_id": CHAT_ID, "text": text})
 
 
+def clear_update_queue():
+    """Clear all pending Telegram updates before starting."""
+    resp = requests.get(f"{API_URL}/getUpdates", timeout=10)
+    data = resp.json()
+    if data.get("result"):
+        last_id = data["result"][-1]["update_id"]
+        requests.get(f"{API_URL}/getUpdates", params={"offset": last_id + 1}, timeout=10)
+        offset_file = Path(__file__).parent.parent / "data" / "last_update.txt"
+        offset_file.parent.mkdir(parents=True, exist_ok=True)
+        offset_file.write_text(str(last_id))
+        logger.info(f"Cleared update queue up to {last_id}")
+
+
 def check_responses():
+    """Check for NEW button presses. Returns list of (action_string, callback_query)."""
     offset_file = Path(__file__).parent.parent / "data" / "last_update.txt"
     offset_file.parent.mkdir(parents=True, exist_ok=True)
     offset = int(offset_file.read_text().strip()) if offset_file.exists() else 0
@@ -105,30 +119,60 @@ def check_responses():
         offset_file.write_text(str(update_id))
         callback = update.get("callback_query")
         if callback:
-            requests.post(f"{API_URL}/answerCallbackQuery", json={
-                "callback_query_id": callback["id"], "text": "OK"
-            })
-            results.append(callback["data"])
+            results.append((callback["data"], callback))
     
     return results
 
 
 def process_actions(actions, current_day_pids):
+    """Process button presses and update messages to show feedback."""
     conn = sqlite3.connect(str(DB_PATH))
-    for action_str in actions:
+    
+    for action_str, callback in actions:
+        chat_id = callback["message"]["chat"]["id"]
+        message_id = callback["message"]["message_id"]
+        original_text = callback["message"].get("text", "")
+        
         if action_str.startswith("dayok_"):
             for pid in current_day_pids:
                 conn.execute("UPDATE predictions SET status='approved' WHERE id=?", (pid,))
+            new_text = original_text + "\n\n✅ Alle genehmigt!"
             logger.info("All approved for this day")
+            
+            requests.post(f"{API_URL}/editMessageText", json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": new_text,
+                "parse_mode": "HTML"
+            })
+            
         elif "_" in action_str:
             action, pid = action_str.split("_", 1)
             pid = int(pid)
+            
             if action == "ok":
                 conn.execute("UPDATE predictions SET status='approved' WHERE id=?", (pid,))
                 logger.info(f"Approved: {pid}")
+                # Mark the button as pressed
+                new_text = original_text.replace("✅", "✅ ", 1) + "\n✅ Genehmigt"
+                
             elif action == "no":
                 conn.execute("UPDATE predictions SET status='rejected' WHERE id=?", (pid,))
                 logger.info(f"Rejected: {pid}")
+                new_text = original_text.replace("❌", "❌ ", 1) + "\n❌ Abgelehnt"
+            
+            requests.post(f"{API_URL}/editMessageText", json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": new_text,
+                "parse_mode": "HTML"
+            })
+        
+        # Answer the callback
+        requests.post(f"{API_URL}/answerCallbackQuery", json={
+            "callback_query_id": callback["id"]
+        })
+    
     conn.commit()
     conn.close()
 
@@ -185,23 +229,9 @@ def handle_rejection(pid):
         return None
 
 
-def clear_update_queue():
-    """Clear all pending Telegram updates before starting."""
-    resp = requests.get(f"{API_URL}/getUpdates", timeout=10)
-    data = resp.json()
-    if data.get("result"):
-        last_id = data["result"][-1]["update_id"]
-        requests.get(f"{API_URL}/getUpdates", params={"offset": last_id + 1}, timeout=10)
-        offset_file = Path(__file__).parent.parent / "data" / "last_update.txt"
-        offset_file.parent.mkdir(parents=True, exist_ok=True)
-        offset_file.write_text(str(last_id))
-        logger.info(f"Cleared update queue up to {last_id}")
-
-
 def run_confirmation():
     logger.info("Starting confirmation...")
     
-
     # === INITIAL PASS: Send all days ===
     clear_update_queue()
     
@@ -218,7 +248,6 @@ def run_confirmation():
         if actions:
             process_actions(actions, pids)
             
-            # Check if there are still pending entries for this day
             remaining = get_pending_for_day(day)
             if remaining > 0:
                 logger.info(f"{day} still has {remaining} pending, resending...")
@@ -226,9 +255,6 @@ def run_confirmation():
         
         logger.info(f"{day} complete")
         time.sleep(1)
-
-
-
     
     logger.info("Initial pass complete")
     
