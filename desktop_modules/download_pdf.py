@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Module 2.2: PDF downloader with report number parameter.
+"""Module 2.2: PDF downloader - clicks icon, extracts DownloadBR code, downloads via requests.
 Usage: python download_pdf.py           # latest report
        python download_pdf.py 136       # single report
        python download_pdf.py 1 141     # range (1 to 141)
 """
 
+import os
 import re
 import sys
+import time
 import logging
 import pickle
 from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,7 +25,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.azubiheft.de"
 LOGIN_URL = f"{BASE_URL}/Login.aspx"
 OVERVIEW_URL = f"{BASE_URL}/Azubi/Ausbildungsnachweise.aspx"
-DOWNLOAD_DIR = Path(__file__).parent.parent / "downloads"
+DOWNLOAD_DIR = Path("C:/Users/adria/Documents/Berichtsheft/shared")
 COOKIE_FILE = Path(__file__).parent.parent / "auth" / "session.pkl"
 
 USERNAME = os.getenv("WEBSITE_USERNAME")
@@ -70,49 +75,55 @@ def get_latest_report_number():
 
 
 def get_report_numbers():
-    """Figure out which reports to download based on arguments."""
     if len(sys.argv) == 1:
-        # No args: latest only
         latest = get_latest_report_number()
         return [latest] if latest else []
-    
     elif len(sys.argv) == 2:
-        # One arg: single report
         return [int(sys.argv[1])]
-    
     elif len(sys.argv) == 3:
-        # Two args: range from-to
-        start = int(sys.argv[1])
-        end = int(sys.argv[2])
+        start, end = int(sys.argv[1]), int(sys.argv[2])
         return list(range(start, end + 1))
-    
     else:
-        print("Usage: python download_pdf.py [report_number] [end_number]")
         return []
 
 
 def download_report(report_number, page):
-    """Download a single report by number."""
     url = f"{BASE_URL}/Azubi/Wochenansicht.aspx?NachweisNr={report_number}"
     logger.info(f"  Opening report {report_number}...")
     page.goto(url, wait_until="networkidle", timeout=15000)
     
     filepath = DOWNLOAD_DIR / f"report_{report_number}.pdf"
     if filepath.exists():
-        logger.info(f"  Already exists, skipping: {filepath.name}")
+        logger.info(f"  Already exists, skipping")
         return True
     
-    logger.info(f"  Click the download button. Press Enter after download starts...")
+    # Click the PDF icon to trigger CallAjax
+    page.wait_for_selector("#spanPDF", state="visible", timeout=10000)
+    page.eval_on_selector("#spanPDF", "el => el.click()")
+    page.wait_for_timeout(3000)
     
-    try:
-        with page.expect_download(timeout=120000) as download_info:
-            input("  > ")
-        download_info.value.save_as(str(filepath))
-        logger.info(f"  Saved: {filepath.name}")
+    # Extract the download code from the page
+    html = page.content()
+    codes = re.findall(r'DownloadBR\.ashx\?Code=([^"\']+)', html)
+    
+    if codes:
+        code = codes[0]
+        download_url = f"{BASE_URL}/Azubi/DownloadBR.ashx?Code={code}"
+        logger.info(f"  Downloading...")
+        
+        # Use requests with cookies to download
+        session = requests.Session()
+        with open(COOKIE_FILE, "rb") as f:
+            cookies = pickle.load(f)
+        session.cookies.update(cookies)
+        
+        resp = session.get(download_url, timeout=30)
+        filepath.write_bytes(resp.content)
+        logger.info(f"  Saved: {filepath.name} ({len(resp.content)} bytes)")
         return True
-    except Exception as e:
-        logger.error(f"  Failed: {e}")
-        return False
+    
+    logger.error(f"  No download code found")
+    return False
 
 
 def main():
@@ -134,14 +145,11 @@ def main():
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
         
-        # Inject cookies once
         page.goto(BASE_URL, wait_until="domcontentloaded")
         for cookie in cookies:
             page.context.add_cookies([{
-                "name": cookie.name,
-                "value": cookie.value,
-                "domain": ".azubiheft.de",
-                "path": "/"
+                "name": cookie.name, "value": cookie.value,
+                "domain": ".azubiheft.de", "path": "/"
             }])
         
         success = 0
