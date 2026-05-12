@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 DOWNLOADS_DIR = Path(__file__).parent.parent / "downloads"
 
-# Map all known day name variants to canonical names
 DAY_NAMES = {
     "Montag": "Montag",
     "Dienstag": "Dienstag",
@@ -123,10 +122,17 @@ def parse_pdf(filepath):
             total = sum(a["hours"] for a in day_data["activities"])
             is_special = any(a["task"] in SPECIAL_DAYS for a in day_data["activities"])
             
+            if is_special:
+                status = "special"
+            elif total < TARGET_HOURS[day_name]:
+                status = "partial"
+            else:
+                status = "present"
+            
             bericht["days"][day_name] = {
                 "art": day_data["art"],
                 "abt": day_data["abt"],
-                "status": "special" if is_special else "present",
+                "status": status,
                 "total_hours": total,
                 "target_hours": TARGET_HOURS[day_name],
                 "activities": day_data["activities"],
@@ -141,14 +147,20 @@ def parse_pdf(filepath):
                 "activities": [],
             }
     
-    present = [d for d in ordered_days if bericht["days"][d]["status"] != "empty"]
-    logger.info(f"Report {header.get('report_nr')}, Week {header.get('week')}, Days: {present}")
+    # Print summary
+    present = [d for d in ordered_days if bericht["days"][d]["status"] in ("present", "special")]
+    partial = [d for d in ordered_days if bericht["days"][d]["status"] == "partial"]
+    empty = [d for d in ordered_days if bericht["days"][d]["status"] == "empty"]
+    
+    logger.info(f"Report {header.get('report_nr')}, Week {header.get('week')}: "
+                f"{len(present)} present, {len(partial)} partial, {len(empty)} empty")
     
     return bericht
 
 
 if __name__ == "__main__":
     import sys
+    from pprint import pprint
     
     if len(sys.argv) > 1:
         filepath = DOWNLOADS_DIR / f"report_{sys.argv[1]}.pdf"
@@ -161,6 +173,6 @@ if __name__ == "__main__":
     
     result = parse_pdf(filepath)
     if result:
-        print(f"OK: Report {result['report_nr']}, Week {result['week']}")
-        for day, data in result['days'].items():
-            print(f"  {day}: {data['status']} ({data['total_hours']}h / {data['target_hours']}h)")
+        for day_name in ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]:
+            d = result["days"][day_name]
+            print(f"  {day_name}: {d['status']} ({d['total_hours']}h / {d['target_hours']}h)")

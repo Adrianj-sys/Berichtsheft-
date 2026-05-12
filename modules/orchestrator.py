@@ -19,7 +19,7 @@ DB_PATH = Path(__file__).parent.parent / "data" / "predictions.db"
 
 
 def get_processed_weeks():
-    """Get set of week numbers that are fully processed (all 5 days have approved entries)."""
+    """Get set of week numbers that are fully processed."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
@@ -52,7 +52,6 @@ def get_unprocessed_pdfs():
     for pdf in pdfs:
         bericht = parse_pdf(pdf)
         if bericht is None:
-            logger.info(f"Skipping {pdf.name}: empty week")
             continue
         if bericht["week"] not in processed_weeks:
             unprocessed.append((pdf, bericht))
@@ -61,14 +60,13 @@ def get_unprocessed_pdfs():
 
 
 def store_existing_activities(bericht):
-    """Auto-approve activities that already exist in the PDF. Stores only if not already present."""
+    """Auto-approve activities that already exist in the PDF."""
     conn = sqlite3.connect(str(DB_PATH))
     stored = 0
     
     for day_name, day_info in bericht["days"].items():
-        if day_info["status"] in ["present", "special"]:
+        if day_info["status"] in ["present", "special", "partial"]:
             for activity in day_info["activities"]:
-                # Check if this exact entry already exists
                 existing = conn.execute(
                     "SELECT id FROM predictions WHERE week=? AND day=? AND task=? AND hours=? AND status='approved'",
                     (bericht["week"], day_name, activity["task"], activity["hours"])
@@ -92,21 +90,20 @@ def process_report(pdf_path, bericht):
     week = bericht["week"]
     report_nr = bericht["report_nr"]
     
-    empty_days = [d for d, info in bericht["days"].items() if info["status"] == "empty"]
-    present_days = [d for d, info in bericht["days"].items() if info["status"] in ("present", "special")]
+    empty_days = [d for d, info in bericht["days"].items() if info["status"] in ("empty", "partial")]
+    complete_days = [d for d, info in bericht["days"].items() if info["status"] in ("present", "special")]
     
-    logger.info(f"Report {report_nr}, Week {week}: {len(present_days)} present, {len(empty_days)} empty")
+    logger.info(f"Report {report_nr}, Week {week}: {len(complete_days)} complete, {len(empty_days)} need AI")
     
     # Auto-approve existing activities
-    if present_days:
-        store_existing_activities(bericht)
+    store_existing_activities(bericht)
     
-    # If no empty days, we're done
+    # If no days need AI, we're done
     if not empty_days:
         logger.info(f"Week {week} is fully complete. No AI needed.")
         return
     
-    logger.info(f"Empty days to predict: {empty_days}")
+    logger.info(f"Days needing AI: {empty_days}")
     
     # Get PDF text
     doc = fitz.open(str(pdf_path))
@@ -115,43 +112,13 @@ def process_report(pdf_path, bericht):
         pdf_text += page.get_text()
     doc.close()
     
-    # Add context about already-completed days
-    completed_info = ""
-    if present_days:
-        completed_info = "\n\nBEREITS AUSGEFUELLTE TAGE (diese NICHT neu generieren):\n"
-        for d in present_days:
-            activities = bericht["days"][d]["activities"]
-            for a in activities:
-                completed_info += f"  {d}: {a['task']} ({a['hours']}h)\n"
-        completed_info += "\nGeneriere NUR fuer diese leeren Tage: " + ", ".join(empty_days)
-    
-    pdf_text = completed_info + "\n\n" + pdf_text
-    
-    # Run prediction
-    result = predict(pdf_text)
+    # Run prediction, skipping complete days
+    result = predict(pdf_text, skip_days=complete_days)
     if result:
         logger.info(f"Predictions ready for week {week}")
         run_confirmation()
     else:
         logger.error(f"Prediction failed for week {week}")
-    
-    # Clean up: remove any AI-generated entries for days that already had PDF content
-    if present_days:
-        conn = sqlite3.connect(str(DB_PATH))
-        for day_name in present_days:
-            original_tasks = [a["task"] for a in bericht["days"][day_name]["activities"]]
-            # Delete entries for this day that aren't the originals
-            for task in original_tasks:
-                conn.execute("""
-                    DELETE FROM predictions 
-                    WHERE week=? AND day=? AND task=? AND status='approved'
-                    AND id NOT IN (
-                        SELECT MIN(id) FROM predictions 
-                        WHERE week=? AND day=? AND task=? AND status='approved'
-                    )
-                """, (week, day_name, task, week, day_name, task))
-        conn.commit()
-        conn.close()
 
 
 def run():

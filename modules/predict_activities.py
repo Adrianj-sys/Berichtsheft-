@@ -136,8 +136,11 @@ Antworte NUR mit dem JSON, keine Erklaerung."""
     return prompt
 
 
-def store_predictions(prediction):
-    """Save predictions to database."""
+def store_predictions(prediction, skip_days=None):
+    """Save predictions to database, skipping specified days."""
+    if skip_days is None:
+        skip_days = []
+    
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     
@@ -156,19 +159,28 @@ def store_predictions(prediction):
     
     conn.execute("DELETE FROM predictions WHERE week=? AND status='pending'", (prediction.week,))
     
+    stored = 0
     for day in prediction.days:
+        if day.day in skip_days:
+            logger.info(f"  Skipping {day.day} (already complete)")
+            continue
         for activity in day.activities:
             conn.execute(
                 "INSERT INTO predictions (week, department, day, task, hours, status) VALUES (?, ?, ?, ?, ?, 'pending')",
                 (prediction.week, prediction.department, day.day, activity.task, activity.hours)
             )
+            stored += 1
+    
     conn.commit()
     conn.close()
-    logger.info(f"Stored {sum(len(d.activities) for d in prediction.days)} predictions")
+    logger.info(f"Stored {stored} predictions (skipped {len(skip_days)} days)")
 
 
-def predict(pdf_text):
+def predict(pdf_text, skip_days=None):
     """Main function: parse PDF, get history, call Gemini with retry."""
+    if skip_days is None:
+        skip_days = []
+    
     department, week = parse_pdf_text(pdf_text)
     if not department or not week:
         logger.error("Could not parse department or week from PDF")
@@ -179,6 +191,9 @@ def predict(pdf_text):
         return None
     
     logger.info(f"Predicting for week {week}, department: {department}")
+    if skip_days:
+        logger.info(f"  Will skip: {skip_days}")
+    
     approved = get_correction_history()
     logger.info(f"Loaded {len(approved)} approved entries")
     
@@ -201,7 +216,7 @@ def predict(pdf_text):
                 text = text[:-3]
             
             prediction = WeekPrediction.model_validate_json(text.strip())
-            store_predictions(prediction)
+            store_predictions(prediction, skip_days)
             logger.info("Successfully stored predictions")
             return prediction
         
