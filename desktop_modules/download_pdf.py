@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Module 2.2: PDF downloader with report number parameter.
+"""Module 2.2: PDF downloader - clicks icon, extracts DownloadBR code, downloads via requests.
 Usage: python download_pdf.py           # latest report
        python download_pdf.py 136       # single report
        python download_pdf.py 1 141     # range (1 to 141)
@@ -8,6 +8,7 @@ Usage: python download_pdf.py           # latest report
 import os
 import re
 import sys
+import time
 import logging
 import pickle
 from pathlib import Path
@@ -96,37 +97,33 @@ def download_report(report_number, page):
         logger.info(f"  Already exists, skipping")
         return True
     
-    logger.info(f"  Downloading...")
+    # Click the PDF icon to trigger CallAjax
+    page.wait_for_selector("#spanPDF", state="visible", timeout=10000)
+    page.eval_on_selector("#spanPDF", "el => el.click()")
+    page.wait_for_timeout(3000)
     
-    try:
-        page.wait_for_selector("#spanPDF", state="visible", timeout=10000)
-        box = page.locator("#spanPDF").bounding_box()
+    # Extract the download code from the page
+    html = page.content()
+    codes = re.findall(r'DownloadBR\.ashx\?Code=([^"\']+)', html)
+    
+    if codes:
+        code = codes[0]
+        download_url = f"{BASE_URL}/Azubi/DownloadBR.ashx?Code={code}"
+        logger.info(f"  Downloading...")
         
-        if not box:
-            logger.error("  Could not find PDF icon")
-            return False
+        # Use requests with cookies to download
+        session = requests.Session()
+        with open(COOKIE_FILE, "rb") as f:
+            cookies = pickle.load(f)
+        session.cookies.update(cookies)
         
-        x = box["x"] + box["width"] / 2
-        y = box["y"] + box["height"] / 2
-        
-        with page.expect_download(timeout=30000) as download_info:
-            page.mouse.click(x, y)
-        
-        download_info.value.save_as(str(filepath))
-        logger.info(f"  Saved: {filepath.name}")
+        resp = session.get(download_url, timeout=30)
+        filepath.write_bytes(resp.content)
+        logger.info(f"  Saved: {filepath.name} ({len(resp.content)} bytes)")
         return True
-        
-    except Exception as e:
-        logger.info(f"  Click failed, trying JS fallback...")
-        try:
-            with page.expect_download(timeout=30000) as download_info:
-                page.evaluate("document.getElementById('spanPDF').click()")
-            download_info.value.save_as(str(filepath))
-            logger.info(f"  Saved via JS: {filepath.name}")
-            return True
-        except Exception as e2:
-            logger.error(f"  Both methods failed: {e2}")
-            return False
+    
+    logger.error(f"  No download code found")
+    return False
 
 
 def main():
@@ -151,10 +148,8 @@ def main():
         page.goto(BASE_URL, wait_until="domcontentloaded")
         for cookie in cookies:
             page.context.add_cookies([{
-                "name": cookie.name,
-                "value": cookie.value,
-                "domain": ".azubiheft.de",
-                "path": "/"
+                "name": cookie.name, "value": cookie.value,
+                "domain": ".azubiheft.de", "path": "/"
             }])
         
         success = 0
