@@ -54,7 +54,7 @@ def parse_pdf(filepath):
         if "keine Berichte" in page_text:
             logger.info(f"Empty week: {filepath.name}")
             doc.close()
-            return None
+            return {"empty": True, "report_nr": None}
         text += page_text
     doc.close()
     
@@ -168,7 +168,6 @@ def parse_pdf(filepath):
 
 if __name__ == "__main__":
     import sys
-    from pprint import pprint
     
     if len(sys.argv) > 1:
         filepath = DOWNLOADS_DIR / f"report_{sys.argv[1]}.pdf"
@@ -181,6 +180,9 @@ if __name__ == "__main__":
     
     result = parse_pdf(filepath)
     if result:
-        for day_name in ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]:
-            d = result["days"][day_name]
-            print(f"  {day_name}: {d['status']} ({d['total_hours']}h / {d['target_hours']}h)")
+        if result.get("empty"):
+            print("Empty week")
+        else:
+            for day_name in ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]:
+                d = result["days"][day_name]
+                print(f"  {day_name}: {d['status']} ({d['total_hours']}h / {d['target_hours']}h)")
