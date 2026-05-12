@@ -95,25 +95,37 @@ def process_report(pdf_path, bericht):
     
     logger.info(f"Report {report_nr}, Week {week}: {len(complete_days)} complete, {len(empty_days)} need AI")
     
-    # Auto-approve existing activities
     store_existing_activities(bericht)
     
-    # If no days need AI, we're done
     if not empty_days:
         logger.info(f"Week {week} is fully complete. No AI needed.")
         return
     
     logger.info(f"Days needing AI: {empty_days}")
     
-    # Get PDF text
+    # Build partial days info
+    partial_info = ""
+    partial_days_list = [d for d in empty_days if bericht["days"][d]["status"] == "partial"]
+    if partial_days_list:
+        for d in partial_days_list:
+            existing = bericht["days"][d]
+            remaining = existing["target_hours"] - existing["total_hours"]
+            partial_info += f"\n{d}: Generiere NUR {remaining}h zusaetzlich. Bestehende Eintraege BEHALTEN:\n"
+            for a in existing["activities"]:
+                partial_info += f"  BEHALTEN: {a['task']} ({a['hours']}h)\n"
+    
+    logger.info(f"PARTIAL INFO: {partial_info if partial_info else 'None'}")
+    
     doc = fitz.open(str(pdf_path))
     pdf_text = ""
     for page in doc:
         pdf_text += page.get_text()
     doc.close()
     
-    # Run prediction, skipping complete days
-    result = predict(pdf_text, skip_days=complete_days)
+    result = predict(pdf_text, skip_days=complete_days,
+                     ausbildungsjahr=bericht.get("ausbildungsjahr"),
+                     betrieb=bericht.get("betrieb"),
+                     partial_days_info=partial_info if partial_info else None)
     if result:
         logger.info(f"Predictions ready for week {week}")
         run_confirmation()

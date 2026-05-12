@@ -30,8 +30,11 @@ TARGET_HOURS = {"Montag": 8.0, "Dienstag": 8.0, "Mittwoch": 8.0, "Donnerstag": 8
 def parse_hours(text):
     text = text.strip()
     if ":" in text:
-        h, m = text.split(":")
-        return int(h) + int(m) / 60.0
+        try:
+            h, m = text.split(":")
+            return int(h) + int(m) / 60.0
+        except (ValueError, TypeError):
+            return 0.0
     return 0.0
 
 
@@ -68,7 +71,11 @@ def parse_pdf(filepath):
             header["zeitraum"] = line.split("Zeitraum:")[-1].strip()
         elif "Abteilung:" in line:
             header["department"] = line.split("Abteilung:")[-1].strip()
-        if len(header) >= 4:
+        elif "Ausbildungsjahr:" in line:
+            header["ausbildungsjahr"] = line.split("Ausbildungsjahr:")[-1].strip()
+        elif "Betrieb:" in line:
+            header["betrieb"] = line.split("Betrieb:")[-1].strip()
+        if len(header) >= 6:
             break
     
     # --- Find date lines ---
@@ -113,6 +120,8 @@ def parse_pdf(filepath):
         "week": header.get("week"),
         "zeitraum": header.get("zeitraum"),
         "department": header.get("department"),
+        "ausbildungsjahr": header.get("ausbildungsjahr", "3. Jahr"),
+        "betrieb": header.get("betrieb", "Peri SE"),
         "days": {},
     }
     
@@ -147,7 +156,6 @@ def parse_pdf(filepath):
                 "activities": [],
             }
     
-    # Print summary
     present = [d for d in ordered_days if bericht["days"][d]["status"] in ("present", "special")]
     partial = [d for d in ordered_days if bericht["days"][d]["status"] == "partial"]
     empty = [d for d in ordered_days if bericht["days"][d]["status"] == "empty"]

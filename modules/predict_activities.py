@@ -87,7 +87,7 @@ def is_skipped_department(department):
     return any(kw in department.lower() for kw in [k.lower() for k in skip_keywords])
 
 
-def build_prompt(pdf_text, department, week, approved):
+def build_prompt(pdf_text, department, week, approved, ausbildungsjahr=None, betrieb=None, partial_days_info=None):
     """Build the Gemini prompt with rules and history."""
     approved_text = ""
     if approved:
@@ -95,9 +95,10 @@ def build_prompt(pdf_text, department, week, approved):
         for w, dept, day, task, hours in approved:
             approved_text += f"  Woche {w}, {dept}, {day}: {task} ({hours}h)\n"
     
-    prompt = f"""Du bist ein Auszubildender im 3. Lehrjahr. Schreibe Taetigkeiten fuer den Ausbildungsnachweis.
+    prompt = f"""Du bist ein Auszubildender im {ausbildungsjahr or '3. Lehrjahr'} bei {betrieb or 'einem Industriebetrieb'} in Weissenhorn, Deutschland. Schreibe Taetigkeiten fuer den Ausbildungsnachweis.
 
 ABTEILUNG: {department}
+HINWEIS: Die Abteilung bleibt jede Woche gleich. Alle Taetigkeiten muessen zu dieser Abteilung passen.
 WOCHE: {week}
 
 REGELN:
@@ -105,15 +106,34 @@ REGELN:
 - Kein Tag darf fehlen
 - Montag bis Donnerstag: genau 8 Stunden pro Tag
 - Freitag: genau 5.5 Stunden
-- Keine Eintraege fuer: Feiertag, Urlaub, Arbeitsunfaehig
+- KEINE Eintraege fuer: Feiertag, Urlaub, Arbeitsunfaehig, Schule, Berufsschule
+- Lies NICHT die Art-Angaben (Betrieb/Schule/Feiertag). Ignoriere diese komplett.
+- Generiere NIEMALS nicht-technische Eintraege wie Schule, Feiertag oder Urlaub.
 - "Berichtsheft geschrieben" darf maximal 2 Stunden pro Woche haben
-- Taetigkeiten muessen zur Abteilung passen
+- Taetigkeiten muessen zur Abteilung {department} passen
 - Schreibe im gleichen Stil wie die frueheren Eintraege
 - Technische Taetigkeiten bevorzugen
+- JEDER Eintrag muss EINZIGARTIG sein. Keine zwei gleichen oder aehnlichen Taetigkeiten.
+- Verwende EINFACHE, klare Sprache. Keine komplizierten Fachwoerter. Schreibe wie ein Azubi im 3. Lehrjahr.
+- Kurze, direkte Saetze. Zum Beispiel "Kabel verlegt" statt "Durchfuehrung der Kabelverlegung".
+- Jeder Eintrag muss mindestens 0.5 Stunden haben. Alle Stunden in 0.5er Schritten (0.5, 1.0, 1.5, 2.0...).
+- Zu lange Eintraege duerfen in mehrere kleinere aufgeteilt werden.
+- Verlaengere bestehende Eintraege an teilweise gefuellten Tagen bevor du neue Eintraege erstellst.
+- Wenn ein Tag mehr Stunden hat als erlaubt, verteile die ueberschuessigen Stunden auf umliegende leere Tage.
 
-{approved_text}
+{approved_text}"""
 
-Aktueller Berichtstext (was diese Woche tatsaechlich gemacht wurde):
+    if partial_days_info:
+        prompt += f"""
+
+TEILWEISE AUSGEFUELLTE TAGE:
+{partial_days_info}
+
+WICHTIG: Generiere NUR die FEHLENDEN Stunden fuer diese Tage. Die bestehenden Eintraege werden BEHALTEN."""
+
+    prompt += f"""
+
+Aktueller Berichtstext:
 {pdf_text[:3000]}
 
 Erstelle eine JSON-Antwort mit diesem exakten Format:
@@ -176,7 +196,7 @@ def store_predictions(prediction, skip_days=None):
     logger.info(f"Stored {stored} predictions (skipped {len(skip_days)} days)")
 
 
-def predict(pdf_text, skip_days=None):
+def predict(pdf_text, skip_days=None, ausbildungsjahr=None, betrieb=None, partial_days_info=None):
     """Main function: parse PDF, get history, call Gemini with retry."""
     if skip_days is None:
         skip_days = []
@@ -197,7 +217,7 @@ def predict(pdf_text, skip_days=None):
     approved = get_correction_history()
     logger.info(f"Loaded {len(approved)} approved entries")
     
-    prompt = build_prompt(pdf_text, department, week, approved)
+    prompt = build_prompt(pdf_text, department, week, approved, ausbildungsjahr, betrieb, partial_days_info)
     
     max_retries = 5
     retry_delay = 10
@@ -209,6 +229,8 @@ def predict(pdf_text, skip_days=None):
                 contents=prompt
             )
             text = response.text.strip()
+            
+            logger.info(f"AI RAW RESPONSE:\n{text[:500]}")
             
             if text.startswith("```json"):
                 text = text[7:]
@@ -267,6 +289,8 @@ NICHT VORSCHLAGEN:
 
 Schlage EINE NEUE Taetigkeit vor, die {hours}h dauert und zum Tag {day} passt.
 Schreibe NUR die Taetigkeit, nicht den Tag oder die Stundenzahl.
+Verwende EINFACHE Sprache. Kurze, direkte Saetze.
+Wenn noetig, teile den Eintrag in mehrere kleinere Eintraege auf (mindestens 0.5h pro Eintrag, in 0.5er Schritten).
 
 Antworte NUR mit JSON:
 {{"task": "Neue Taetigkeit", "hours": {hours}}}"""
