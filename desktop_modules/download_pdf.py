@@ -5,6 +5,7 @@ Usage: python download_pdf.py           # latest report
        python download_pdf.py 1 141     # range (1 to 141)
 """
 
+import os
 import re
 import sys
 import logging
@@ -13,6 +14,9 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,7 +24,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.azubiheft.de"
 LOGIN_URL = f"{BASE_URL}/Login.aspx"
 OVERVIEW_URL = f"{BASE_URL}/Azubi/Ausbildungsnachweise.aspx"
-DOWNLOAD_DIR = Path(__file__).parent.parent / "downloads"
+DOWNLOAD_DIR = Path("C:/Users/adria/Documents/Berichtsheft/shared")
 COOKIE_FILE = Path(__file__).parent.parent / "auth" / "session.pkl"
 
 USERNAME = os.getenv("WEBSITE_USERNAME")
@@ -70,49 +74,59 @@ def get_latest_report_number():
 
 
 def get_report_numbers():
-    """Figure out which reports to download based on arguments."""
     if len(sys.argv) == 1:
-        # No args: latest only
         latest = get_latest_report_number()
         return [latest] if latest else []
-    
     elif len(sys.argv) == 2:
-        # One arg: single report
         return [int(sys.argv[1])]
-    
     elif len(sys.argv) == 3:
-        # Two args: range from-to
-        start = int(sys.argv[1])
-        end = int(sys.argv[2])
+        start, end = int(sys.argv[1]), int(sys.argv[2])
         return list(range(start, end + 1))
-    
     else:
-        print("Usage: python download_pdf.py [report_number] [end_number]")
         return []
 
 
 def download_report(report_number, page):
-    """Download a single report by number."""
     url = f"{BASE_URL}/Azubi/Wochenansicht.aspx?NachweisNr={report_number}"
     logger.info(f"  Opening report {report_number}...")
     page.goto(url, wait_until="networkidle", timeout=15000)
     
     filepath = DOWNLOAD_DIR / f"report_{report_number}.pdf"
     if filepath.exists():
-        logger.info(f"  Already exists, skipping: {filepath.name}")
+        logger.info(f"  Already exists, skipping")
         return True
     
-    logger.info(f"  Click the download button. Press Enter after download starts...")
+    logger.info(f"  Downloading...")
     
     try:
-        with page.expect_download(timeout=120000) as download_info:
-            input("  > ")
+        page.wait_for_selector("#spanPDF", state="visible", timeout=10000)
+        box = page.locator("#spanPDF").bounding_box()
+        
+        if not box:
+            logger.error("  Could not find PDF icon")
+            return False
+        
+        x = box["x"] + box["width"] / 2
+        y = box["y"] + box["height"] / 2
+        
+        with page.expect_download(timeout=30000) as download_info:
+            page.mouse.click(x, y)
+        
         download_info.value.save_as(str(filepath))
         logger.info(f"  Saved: {filepath.name}")
         return True
+        
     except Exception as e:
-        logger.error(f"  Failed: {e}")
-        return False
+        logger.info(f"  Click failed, trying JS fallback...")
+        try:
+            with page.expect_download(timeout=30000) as download_info:
+                page.evaluate("document.getElementById('spanPDF').click()")
+            download_info.value.save_as(str(filepath))
+            logger.info(f"  Saved via JS: {filepath.name}")
+            return True
+        except Exception as e2:
+            logger.error(f"  Both methods failed: {e2}")
+            return False
 
 
 def main():
@@ -134,7 +148,6 @@ def main():
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
         
-        # Inject cookies once
         page.goto(BASE_URL, wait_until="domcontentloaded")
         for cookie in cookies:
             page.context.add_cookies([{
