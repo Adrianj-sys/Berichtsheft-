@@ -149,7 +149,6 @@ def parse_pdf(filepath):
 
 if __name__ == "__main__":
     import sys
-    from pprint import pprint
     
     if len(sys.argv) > 1:
         filepath = DOWNLOADS_DIR / f"report_{sys.argv[1]}.pdf"
@@ -162,4 +161,6 @@ if __name__ == "__main__":
     
     result = parse_pdf(filepath)
     if result:
-        pprint(result)
+        print(f"OK: Report {result['report_nr']}, Week {result['week']}")
+        for day, data in result['days'].items():
+            print(f"  {day}: {data['status']} ({data['total_hours']}h / {data['target_hours']}h)")

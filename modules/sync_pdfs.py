@@ -1,43 +1,53 @@
 #!/usr/bin/env python3
-"""Pull new PDFs from Desktop HTTP server to Pi."""
+"""Sync PDFs from Desktop via SCP."""
 
+import subprocess
 import logging
-import requests
 from pathlib import Path
-from bs4 import BeautifulSoup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-DESKTOP_URL = "http://192.168.178.38:8080"
+DESKTOP_IP = "192.168.178.38"
+KEY_FILE = Path.home() / ".ssh" / "berichtsheft_key"
+REMOTE_DIR = f"adria@{DESKTOP_IP}:/Users/adria/Documents/Berichtsheft/shared/"
 DOWNLOAD_DIR = Path(__file__).parent.parent / "downloads"
 
 
-def list_remote():
-    """Get list of PDFs on desktop."""
-    resp = requests.get(DESKTOP_URL, timeout=10)
-    soup = BeautifulSoup(resp.text, "html.parser")
-    return [a["href"] for a in soup.find_all("a") if a["href"].endswith(".pdf")]
-
-
 def sync():
-    """Download any PDFs not already on Pi."""
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    remote_files = list_remote()
     
-    downloaded = 0
+    # First, list remote files
+    list_result = subprocess.run(
+        ["ssh", "-i", str(KEY_FILE), f"adria@{DESKTOP_IP}", "dir", "C:\\Users\\adria\\Documents\\Berichtsheft\\shared\\*.pdf", "/b"],
+        capture_output=True, text=True, shell=False
+    )
+    
+    if list_result.returncode != 0:
+        logger.info("No PDFs found on desktop")
+        return
+    
+    remote_files = [f.strip() for f in list_result.stdout.split("\n") if f.strip()]
+    
+    if not remote_files:
+        logger.info("No PDFs to sync")
+        return
+    
     for filename in remote_files:
-        filepath = DOWNLOAD_DIR / filename
-        if filepath.exists():
+        local_path = DOWNLOAD_DIR / filename
+        if local_path.exists():
             continue
         
-        logger.info(f"Downloading {filename}...")
-        resp = requests.get(f"{DESKTOP_URL}/{filename}", timeout=60)
-        filepath.write_bytes(resp.content)
-        downloaded += 1
-        logger.info(f"  Saved: {filename}")
-    
-    logger.info(f"Synced: {downloaded} new files")
+        remote_path = f"adria@{DESKTOP_IP}:/Users/adria/Documents/Berichtsheft/shared/{filename}"
+        result = subprocess.run(
+            ["scp", "-i", str(KEY_FILE), remote_path, str(local_path)],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"Downloaded: {filename}")
+        else:
+            logger.error(f"Failed: {filename} - {result.stderr}")
 
 
 if __name__ == "__main__":
