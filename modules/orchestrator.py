@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Module 3.1: Orchestrator — runs the full pipeline with background pre-processing."""
+"""Module 3.1: Orchestrator with background pre-processing."""
 
 import logging
 import sqlite3
@@ -11,7 +11,6 @@ from parse_pdf import parse_pdf, DOWNLOADS_DIR
 from predict_activities import predict, init_db
 from telegram_confirm import (
     run_confirmation, send_message, notify_empty, notify_backlog_start,
-    last_interaction_time, pre_process_triggered, current_report_nr
 )
 
 logging.basicConfig(
@@ -20,17 +19,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent.parent / "data" / "predictions.db"
+DB_PATH = str(Path(__file__).parent.parent / "data" / "predictions.db")
 
-# Module-level globals for pre-processing
 queued_reports = {}
 pre_process_lock = threading.Lock()
+last_interaction_time = time.time()
+pre_process_triggered = False
+current_report_nr = None
+
+
+def _connect():
+    return sqlite3.connect(DB_PATH, timeout=30)
 
 
 def get_processed_reports():
-    """Get set of report numbers that are fully processed."""
     init_db()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = _connect()
     rows = conn.execute("""
         SELECT report_nr FROM predictions 
         WHERE status='approved' 
@@ -42,7 +46,6 @@ def get_processed_reports():
 
 
 def get_unprocessed_pdfs():
-    """Find PDFs not yet processed, sorted by total hours descending."""
     processed = get_processed_reports()
     pdfs = sorted(DOWNLOADS_DIR.glob("report_*.pdf"))
     unprocessed = []
@@ -62,9 +65,8 @@ def get_unprocessed_pdfs():
 
 
 def store_existing_activities(bericht):
-    """Auto-approve activities that already exist in the PDF."""
     init_db()
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = _connect()
     stored = 0
     
     for day_name, day_info in bericht["days"].items():
@@ -77,8 +79,8 @@ def store_existing_activities(bericht):
                 
                 if not existing:
                     conn.execute(
-                        "INSERT INTO predictions (report_nr, week, department, day, task, original_task, hours, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'approved')",
-                        (bericht["report_nr"], bericht.get("week", 0), bericht["department"], day_name, activity["task"], activity["task"], activity["hours"])
+                        "INSERT INTO predictions (report_nr, department, day, task, original_task, hours, status) VALUES (?, ?, ?, ?, ?, ?, 'approved')",
+                        (bericht["report_nr"], bericht["department"], day_name, activity["task"], activity["task"], activity["hours"])
                     )
                     stored += 1
     
@@ -89,7 +91,6 @@ def store_existing_activities(bericht):
 
 
 def pre_process_reports(unprocessed_list, start_from_index):
-    """Pre-process upcoming reports in background. Stores with status='queued'."""
     global queued_reports
     
     for i in range(start_from_index, len(unprocessed_list)):
@@ -108,20 +109,11 @@ def pre_process_reports(unprocessed_list, start_from_index):
         store_existing_activities(bericht)
         
         if not empty_days:
-            logger.info(f"Report {report_nr} is fully complete. No AI needed.")
             with pre_process_lock:
                 queued_reports[report_nr] = {"status": "complete"}
             continue
         
-        partial_info = ""
-        partial_days_list = [d for d in empty_days if bericht["days"][d]["status"] == "partial"]
-        if partial_days_list:
-            for d in partial_days_list:
-                existing = bericht["days"][d]
-                remaining = existing["target_hours"] - existing["total_hours"]
-                partial_info += f"\n{d}: Generiere NUR {remaining}h zusaetzlich. Bestehende Eintraege BEHALTEN:\n"
-                for a in existing["activities"]:
-                    partial_info += f"  BEHALTEN: {a['task']} ({a['hours']}h)\n"
+        partial_info, partial_days_list, existing_entries = _build_partial_info(bericht, empty_days)
         
         doc = fitz.open(str(pdf_path))
         pdf_text = ""
@@ -132,27 +124,43 @@ def pre_process_reports(unprocessed_list, start_from_index):
         result = predict(pdf_text, skip_days=complete_days,
                          ausbildungsjahr=bericht.get("ausbildungsjahr"),
                          betrieb=bericht.get("betrieb"),
-                         partial_days_info=partial_info if partial_info else None)
+                         partial_days_info=partial_info if partial_info else None,
+                         partial_days=partial_days_list,
+                         existing_entries=existing_entries)
         
         with pre_process_lock:
             if result:
                 queued_reports[report_nr] = {"status": "ready"}
-                logger.info(f"Background: Report {report_nr} pre-processed and queued")
             else:
                 queued_reports[report_nr] = {"status": "failed"}
     
     logger.info("Background pre-processing complete")
-    notify_backlog_start(unprocessed_list[start_from_index][1]["report_nr"])
+
+
+def _build_partial_info(bericht, empty_days):
+    partial_info = ""
+    partial_days_list = [d for d in empty_days if bericht["days"][d]["status"] == "partial"]
+    existing_entries = {}
+    
+    if partial_days_list:
+        for d in partial_days_list:
+            existing = bericht["days"][d]
+            remaining = existing["target_hours"] - existing["total_hours"]
+            partial_info += f"\n{d}: Generiere NUR {remaining}h zusaetzlich. Bestehende Eintraege BEHALTEN:\n"
+            existing_entries[d] = []
+            for a in existing["activities"]:
+                partial_info += f"  BEHALTEN: {a['task']} ({a['hours']}h)\n"
+                existing_entries[d].append((a["task"], a["hours"]))
+    
+    return partial_info, partial_days_list, existing_entries
 
 
 def process_report(pdf_path, bericht):
-    """Run the full pipeline on one report."""
     global current_report_nr, last_interaction_time
     
     report_nr = bericht["report_nr"]
     current_report_nr = report_nr
     
-    # Check if already queued from pre-processing
     with pre_process_lock:
         if report_nr in queued_reports:
             q_status = queued_reports[report_nr]["status"]
@@ -177,15 +185,7 @@ def process_report(pdf_path, bericht):
         logger.info(f"Report {report_nr} is fully complete.")
         return
     
-    partial_info = ""
-    partial_days_list = [d for d in empty_days if bericht["days"][d]["status"] == "partial"]
-    if partial_days_list:
-        for d in partial_days_list:
-            existing = bericht["days"][d]
-            remaining = existing["target_hours"] - existing["total_hours"]
-            partial_info += f"\n{d}: Generiere NUR {remaining}h zusaetzlich. Bestehende Eintraege BEHALTEN:\n"
-            for a in existing["activities"]:
-                partial_info += f"  BEHALTEN: {a['task']} ({a['hours']}h)\n"
+    partial_info, partial_days_list, existing_entries = _build_partial_info(bericht, empty_days)
     
     doc = fitz.open(str(pdf_path))
     pdf_text = ""
@@ -196,7 +196,9 @@ def process_report(pdf_path, bericht):
     result = predict(pdf_text, skip_days=complete_days,
                      ausbildungsjahr=bericht.get("ausbildungsjahr"),
                      betrieb=bericht.get("betrieb"),
-                     partial_days_info=partial_info if partial_info else None)
+                     partial_days_info=partial_info if partial_info else None,
+                     partial_days=partial_days_list,
+                     existing_entries=existing_entries)
     if result:
         logger.info(f"Predictions ready for report {report_nr}")
         run_confirmation(report_nr)
@@ -205,7 +207,6 @@ def process_report(pdf_path, bericht):
 
 
 def check_idle_and_preprocess(unprocessed_list, current_index):
-    """Check if user has been idle for 10 minutes and start pre-processing."""
     global last_interaction_time, pre_process_triggered
     
     while True:
@@ -215,20 +216,23 @@ def check_idle_and_preprocess(unprocessed_list, current_index):
         
         idle_time = time.time() - last_interaction_time
         
-        if idle_time > 600 and not pre_process_triggered:  # 10 minutes
+        if idle_time > 600 and not pre_process_triggered:
             pre_process_triggered = True
             next_index = current_index + 1
             if next_index < len(unprocessed_list):
-                logger.info(f"User idle for {idle_time:.0f}s. Starting background pre-processing from index {next_index}")
+                logger.info(f"User idle. Starting background pre-processing from index {next_index}")
+                notify_backlog_start(unprocessed_list[next_index][1]["report_nr"])
                 thread = threading.Thread(target=pre_process_reports, args=(unprocessed_list, next_index))
                 thread.daemon = True
                 thread.start()
 
 
 def run():
+    global last_interaction_time, pre_process_triggered
     logger.info("Orchestrator starting...")
+    last_interaction_time = time.time()
+    pre_process_triggered = False
     
-    # Handle empty weeks
     pdfs = sorted(DOWNLOADS_DIR.glob("report_*.pdf"))
     for pdf in pdfs:
         bericht = parse_pdf(pdf)
@@ -247,7 +251,6 @@ def run():
         total = sum(d["total_hours"] for d in bericht["days"].values())
         logger.info(f"  {i}. Report {bericht['report_nr']}: {total}h")
     
-    # Start idle monitor thread
     monitor_thread = threading.Thread(target=check_idle_and_preprocess, args=(unprocessed, 0))
     monitor_thread.daemon = True
     monitor_thread.start()
@@ -256,8 +259,6 @@ def run():
         logger.info(f"Processing {pdf_path.name}...")
         try:
             process_report(pdf_path, bericht)
-            # Update monitor with current index
-            global last_interaction_time
             last_interaction_time = time.time()
         except Exception as e:
             logger.error(f"Failed to process {pdf_path.name}: {e}")

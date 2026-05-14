@@ -24,6 +24,8 @@ DB_PATH = Path(__file__).parent.parent / "data" / "predictions.db"
 
 MODEL = "gemini-3.1-flash-lite-preview"
 
+TARGET_HOURS = {"Montag": 8.0, "Dienstag": 8.0, "Mittwoch": 8.0, "Donnerstag": 8.0, "Freitag": 5.5}
+
 
 class Activity(BaseModel):
     task: str
@@ -41,7 +43,6 @@ class WeekPrediction(BaseModel):
 
 
 def init_db():
-    """Create tables if they don't exist."""
     conn = sqlite3.connect(str(DB_PATH))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
@@ -62,7 +63,6 @@ def init_db():
 
 
 def get_correction_history():
-    """Load all past approved predictions."""
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
     approved = conn.execute(
@@ -73,7 +73,6 @@ def get_correction_history():
 
 
 def parse_pdf_text(text):
-    """Extract department and report_nr from PDF text."""
     department = None
     report_nr = None
     for line in text.split("\n"):
@@ -88,14 +87,12 @@ def parse_pdf_text(text):
 
 
 def is_skipped_department(department):
-    """Check if this department should be skipped."""
     if not department:
         return False
     return "berufsschule" in department.lower() or "berufschule" in department.lower()
 
 
 def build_prompt(pdf_text, department, report_nr, approved, ausbildungsjahr=None, betrieb=None, partial_days_info=None):
-    """Build the Gemini prompt with rules and history."""
     approved_text = ""
     if approved:
         approved_text = "\nDeine frueheren, korrigierten Vorhersagen (diese sind korrekt):\n"
@@ -167,10 +164,11 @@ Antworte NUR mit dem JSON, keine Erklaerung."""
     return prompt
 
 
-def store_predictions(prediction, skip_days=None):
-    """Save predictions to database, skipping specified days."""
+def store_predictions(prediction, skip_days=None, existing_entries=None):
     if skip_days is None:
         skip_days = []
+    if existing_entries is None:
+        existing_entries = {}
     
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
@@ -184,9 +182,15 @@ def store_predictions(prediction, skip_days=None):
             continue
         for activity in day.activities:
             original = getattr(activity, 'original', '') or ''
+            if not original and existing_entries and day.day in existing_entries:
+                for old_task, old_hours in existing_entries[day.day]:
+                    if activity.hours == old_hours:
+                        original = old_task
+                        break
+            
             conn.execute(
-                "INSERT INTO predictions (report_nr, week, department, day, task, original_task, hours, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
-                (prediction.report_nr, 0, prediction.department, day.day, activity.task, original, activity.hours)
+                "INSERT INTO predictions (report_nr, department, day, task, original_task, hours, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                (prediction.report_nr, prediction.department, day.day, activity.task, original, activity.hours)
             )
             stored += 1
     
@@ -195,10 +199,13 @@ def store_predictions(prediction, skip_days=None):
     logger.info(f"Stored {stored} predictions (skipped {len(skip_days)} days)")
 
 
-def predict(pdf_text, skip_days=None, ausbildungsjahr=None, betrieb=None, partial_days_info=None):
-    """Main function: parse PDF, get history, call Gemini with retry."""
+def predict(pdf_text, skip_days=None, ausbildungsjahr=None, betrieb=None, partial_days_info=None, partial_days=None, existing_entries=None):
     if skip_days is None:
         skip_days = []
+    if partial_days is None:
+        partial_days = []
+    if existing_entries is None:
+        existing_entries = {}
     
     department, report_nr = parse_pdf_text(pdf_text)
     if not department or not report_nr:
@@ -235,7 +242,22 @@ def predict(pdf_text, skip_days=None, ausbildungsjahr=None, betrieb=None, partia
                 text = text[:-3]
             
             prediction = WeekPrediction.model_validate_json(text.strip())
-            store_predictions(prediction, skip_days)
+            
+            # Enforce partial day hour limits
+            if partial_days:
+                for day in prediction.days:
+                    if day.day in partial_days:
+                        target = TARGET_HOURS.get(day.day, 8.0)
+                        kept = []
+                        running_total = 0
+                        for activity in day.activities:
+                            if running_total + activity.hours <= target:
+                                kept.append(activity)
+                                running_total += activity.hours
+                        day.activities = kept
+                        logger.info(f"  Trimmed {day.day} to {running_total}h (target: {target}h)")
+            
+            store_predictions(prediction, skip_days, existing_entries)
             logger.info("Successfully stored predictions")
             return prediction
         
@@ -254,7 +276,6 @@ def predict(pdf_text, skip_days=None, ausbildungsjahr=None, betrieb=None, partia
 
 
 def regenerate_day(report_nr, day, rejected_entries):
-    """Regenerate ALL rejected entries for a day in ONE API call."""
     if not rejected_entries:
         return []
     
