@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V2 Diff Engine: Compare website HTML entries with database."""
+"""V2 Diff Engine: Compare website HTML entries with database, deduplicate, import."""
 
 import logging
 import sqlite3
@@ -9,6 +9,34 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent.parent / "data" / "predictions.db"
+
+
+def deduplicate_report(report_nr):
+    """Remove duplicate entries — keep the one with lowest id."""
+    conn = sqlite3.connect(str(DB_PATH))
+    
+    dupes = conn.execute("""
+        SELECT day, LOWER(task), hours, MIN(id) as keep_id, COUNT(*) as cnt
+        FROM predictions 
+        WHERE report_nr=? AND status='approved'
+        GROUP BY report_nr, day, LOWER(task), hours
+        HAVING cnt > 1
+    """, (report_nr,)).fetchall()
+    
+    deleted = 0
+    for day, task_lower, hours, keep_id, cnt in dupes:
+        conn.execute(
+            "DELETE FROM predictions WHERE report_nr=? AND day=? AND LOWER(task)=? AND hours=? AND id != ? AND status='approved'",
+            (report_nr, day, task_lower, hours, keep_id)
+        )
+        deleted += cnt - 1
+    
+    conn.commit()
+    conn.close()
+    
+    if deleted:
+        logger.info(f"Deduplicated {deleted} entries for report {report_nr}")
+    return deleted
 
 
 def get_db_entries(report_nr):
@@ -29,9 +57,7 @@ def get_db_entries(report_nr):
 
 
 def compare(website_bericht, report_nr):
-    """Compare website entries vs database entries.
-    Returns: to_import, to_submit, matched
-    """
+    """Compare website entries vs database entries."""
     db_entries = get_db_entries(report_nr)
     
     to_import = {}
@@ -77,7 +103,7 @@ def auto_import_entries(report_nr, to_import, department):
             hours = a["hours"]
             
             existing = conn.execute(
-                "SELECT id FROM predictions WHERE report_nr=? AND day=? AND task=? AND hours=?",
+                "SELECT id FROM predictions WHERE report_nr=? AND day=? AND LOWER(task)=LOWER(?) AND hours=?",
                 (report_nr, day, task, hours)
             ).fetchone()
             
@@ -87,7 +113,7 @@ def auto_import_entries(report_nr, to_import, department):
                     (report_nr, department, day, task, task, hours)
                 )
                 imported += 1
-                logger.info(f"Imported: {day}: {task} ({hours}h)")
+                logger.info(f"Imported: {day}: {task[:50]} ({hours}h)")
     
     conn.commit()
     conn.close()
@@ -100,8 +126,8 @@ if __name__ == "__main__":
     report_nr = 139
     bericht = parse_weekly_overview(report_nr)
     if bericht:
+        deduplicate_report(report_nr)
         to_import, to_submit, matched = compare(bericht, report_nr)
-        
-        print(f"To import (website→DB): {sum(len(v) for v in to_import.values())}")
-        print(f"To submit (DB→website): {sum(len(v) for v in to_submit.values())}")
+        print(f"Import: {sum(len(v) for v in to_import.values())}")
+        print(f"Submit: {sum(len(v) for v in to_submit.values())}")
         print(f"Matched: {sum(len(v) for v in matched.values())}")

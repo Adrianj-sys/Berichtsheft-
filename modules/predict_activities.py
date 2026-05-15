@@ -351,6 +351,24 @@ Antworte NUR mit JSON:
     return []
 
 
+def ask_ai(prompt):
+    """Send a raw prompt to Gemini and return parsed JSON."""
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt
+        )
+        text = response.text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return json.loads(text.strip())
+    except Exception as e:
+        logger.error(f"AI ask failed: {e}")
+        return None
+
+
 if __name__ == "__main__":
     sample = """
     Abteilung: Ausbildungszentrum
