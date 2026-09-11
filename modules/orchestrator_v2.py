@@ -57,7 +57,8 @@ def fix_over_limit(bericht):
     report_nr = bericht["report_nr"]
     conn = sqlite3.connect(str(DB_PATH))
     fixed = 0
-    
+    #needs to be Removed a half hour Reset is way too often it maybe updating it to sm like every 6 hours whenever it runs into a token limit 
+    #could possibly have default of one hour 
     for day_name in DAY_ORDER:
         day_info = bericht["days"].get(day_name, {})
         total = day_info.get("total_hours", 0)
