@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.azubiheft.de"
 LOGIN_URL = f"{BASE_URL}/Login.aspx"
 OVERVIEW_URL = f"{BASE_URL}/Azubi/Ausbildungsnachweise.aspx"
-DOWNLOAD_DIR = Path("C:/Users/adria/Documents/Berichtsheft/shared")
+DOWNLOAD_DIR = Path("C:/Users/adria/Documents/Example/Download_Location")
 COOKIE_FILE = Path(__file__).parent.parent / "auth" / "session.pkl"
 
 USERNAME = os.getenv("WEBSITE_USERNAME")
