@@ -1,62 +1,115 @@
-#!/usr/bin/env python3
-"""Trigger form fill on Desktop from Pi via temp file."""
+﻿#!/usr/bin/env python3
+'''Form fill: delete all entries, then upload fresh ones via Playwright.'''
 
-import sys
-import json
-import sqlite3
-import subprocess
+import sys, json, time, pickle
 from pathlib import Path
+from playwright.sync_api import sync_playwright
 
-DB_PATH = Path(__file__).parent.parent / "data" / "predictions.db"
-DESKTOP = "adria@192.168.178.38"
-SSH_KEY = "~/.ssh/berichtsheft_key"
-DESKTOP_SCRIPT = "C:\\Users\\adria\\Documents\\Berichtsheft\\Berichtsheft-\\desktop_modules\\form_fill.py"
-
-
-def get_entries(report_nr):
-    conn = sqlite3.connect(str(DB_PATH))
-    rows = conn.execute(
-        "SELECT day, task, hours FROM predictions WHERE report_nr=? AND status='approved' AND task!='Skipped' ORDER BY CASE day WHEN 'Montag' THEN 1 WHEN 'Dienstag' THEN 2 WHEN 'Mittwoch' THEN 3 WHEN 'Donnerstag' THEN 4 WHEN 'Freitag' THEN 5 END, id",
-        (report_nr,)
-    ).fetchall()
-    conn.close()
-    
-    entries = {}
-    for day, task, hours in rows:
-        if day not in entries:
-            entries[day] = []
-        entries[day].append({"task": task, "hours": hours})
-    
-    return entries
+BASE_URL = 'https://www.azubiheft.de'
+DAY_ORDER = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag']
+COOKIE_FILE = Path(__file__).parent.parent / 'auth' / 'session.pkl'
 
 
-def trigger_desktop(report_nr):
-    entries = get_entries(report_nr)
+def fill_report(report_nr, json_path):
+    with open(json_path, 'r', encoding='utf-8') as f:
+        entries = json.load(f)
     
-    if not entries:
-        print(f"No approved entries for report {report_nr}")
-        return
+    print(f'Report {report_nr}: {len(entries)} days')
     
-    print(f"Sending {len(entries)} days to Desktop...")
-    
-    # Write JSON to temp file on Pi
-    local_tmp = f"/tmp/form_fill_{report_nr}.json"
-    with open(local_tmp, "w") as f:
-        json.dump(entries, f)
-    
-    # SCP the file to Desktop
-    remote_tmp = f"C:\\Users\\adria\\Documents\\Berichtsheft\\shared\\form_fill_{report_nr}.json"
-    scp_cmd = f"scp -i {SSH_KEY} {local_tmp} {DESKTOP}:{remote_tmp}"
-    subprocess.run(scp_cmd, shell=True, capture_output=True)
-    
-    # Run Desktop script with file path
-    ssh_cmd = f'ssh -i {SSH_KEY} {DESKTOP} "python {DESKTOP_SCRIPT} {report_nr} {remote_tmp}"'
-    result = subprocess.run(ssh_cmd, shell=True, capture_output=True, text=True)
-    print(result.stdout)
-    if result.stderr:
-        print(f"Errors: {result.stderr}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        page = browser.new_page()
+        
+        if COOKIE_FILE.exists():
+            with open(COOKIE_FILE, 'rb') as f:
+                cookies = pickle.load(f)
+            page.goto(BASE_URL, wait_until='domcontentloaded', timeout=10000)
+            for c in cookies:
+                page.context.add_cookies([{'name': c.name, 'value': c.value, 'domain': '.azubiheft.de', 'path': '/'}])
+        
+        try:
+            page.goto(f'{BASE_URL}/Azubi/Default.aspx', wait_until='domcontentloaded', timeout=10000)
+        except:
+            pass
+        
+        if 'Login' in page.url:
+            print('Login needed')
+            page.goto(f'{BASE_URL}/Login.aspx')
+            input('Press Enter after login...')
+        
+        weekly_url = f'{BASE_URL}/Azubi/Wochenansicht.aspx?NachweisNr={report_nr}'
+        
+        print('Deleting existing entries...')
+        for day_name in DAY_ORDER:
+            if day_name not in entries:
+                continue
+            page.goto(weekly_url, wait_until='networkidle', timeout=15000)
+            time.sleep(2)
+            day_divs = page.locator('div.mo')
+            for i in range(day_divs.count()):
+                if day_name in day_divs.nth(i).inner_text():
+                    day_divs.nth(i).click()
+                    page.wait_for_load_state('networkidle', timeout=10000)
+                    time.sleep(1)
+                    break
+            while True:
+                entry_rows = page.locator('div.d0.mo')
+                if entry_rows.count() <= 1:
+                    break
+                try:
+                    entry_rows.nth(1).click()
+                    time.sleep(0.5)
+                    page.click('#cmdDel')
+                    time.sleep(0.5)
+                    page.click('#cmdConfirmBoxOK')
+                    time.sleep(1)
+                except:
+                    break
+            print(f'  {day_name}: cleared')
+        
+        print('Uploading new entries...')
+        page.goto(weekly_url, wait_until='networkidle', timeout=15000)
+        time.sleep(2)
+        for day_name in DAY_ORDER:
+            if day_name not in entries:
+                continue
+            activities = entries[day_name]
+            print(f'{day_name}: {len(activities)} entries')
+            day_divs = page.locator('div.mo')
+            for i in range(day_divs.count()):
+                if day_name in day_divs.nth(i).inner_text():
+                    day_divs.nth(i).click()
+                    page.wait_for_load_state('networkidle', timeout=10000)
+                    time.sleep(1)
+                    break
+            for activity in activities:
+                try:
+                    page.wait_for_selector('#cmdNeue', state='visible', timeout=5000)
+                    page.click('#cmdNeue')
+                    time.sleep(0.5)
+                    page.click('#txtTaetigkeit')
+                    page.keyboard.type(activity['task'])
+                    time.sleep(0.3)
+                    page.click('#cmdDauer')
+                    time.sleep(0.3)
+                    hours_int = int(activity['hours'])
+                    mins = int((activity['hours'] - hours_int) * 60)
+                    time_str = f'{hours_int:02d}{mins:02d}'
+                    for digit in time_str:
+                        page.click(f'.Num.mo:text-is(\'{digit}\')')
+                        time.sleep(0.1)
+                    page.click('#cmdNumOk')
+                    time.sleep(0.3)
+                    page.click('#divOK')
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f'  Error: {e}')
+            page.goto(weekly_url, wait_until='networkidle', timeout=15000)
+            time.sleep(1)
+        
+        print('Done!')
+        browser.close()
 
 
-if __name__ == "__main__":
-    report_nr = int(sys.argv[1]) if len(sys.argv) > 1 else 139
-    trigger_desktop(report_nr)
+if __name__ == '__main__':
+    fill_report(int(sys.argv[1]), sys.argv[2])

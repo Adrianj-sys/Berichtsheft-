@@ -184,8 +184,8 @@ Antworte mit JSON:
 
 
 def trigger_desktop(report_nr):
-    """SCP JSON to Desktop shared folder for watcher."""
-    conn = sqlite3.connect(str(DB_PATH))
+    """Write JSON to shared folder for form fill."""
+    conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT day, task, hours FROM predictions WHERE report_nr=? AND status='approved' AND task!='Skipped'",
         (report_nr,)
@@ -201,21 +201,24 @@ def trigger_desktop(report_nr):
             entries[day] = []
         entries[day].append({"task": task, "hours": hours})
     
-    local_json = f"/tmp/form_fill_{report_nr}.json"
-    remote_json = f"C:/Users/adria/Documents/Berichtsheft/shared/form_fill_{report_nr}.json"
+    json_path = f"C:/Users/adria/Documents/Example/Code/Berichtsheft-/data/form_fill_{report_nr}.json"
+    Path(json_path).parent.mkdir(parents=True, exist_ok=True)
     
-    with open(local_json, "w") as f:
+    with open(json_path, "w") as f:
         json.dump(entries, f)
     
-    subprocess.run(
-        f"scp -i ~/.ssh/berichtsheft_key {local_json} adria@192.168.178.38:\"{remote_json}\"",
-        shell=True
-    )
+    logger.info(f"Trigger: {json_path}")
     
-    logger.info(f"Sent trigger for report {report_nr}")
+    # Run form fill directly
+    form_fill_path = Path(__file__).parent / "form_fill.py"
+    result = subprocess.run(
+        ["python", str(form_fill_path), str(report_nr), json_path],
+        capture_output=True, text=True
+    )
+    if result.stdout:
+        logger.info(f"Form fill: {result.stdout[:100]}")
+    
     return True
-
-
 
 
 def process_report_full(report_nr):

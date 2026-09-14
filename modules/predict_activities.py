@@ -11,7 +11,8 @@ from google import genai
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-load_dotenv()
+from pathlib import Path
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
