@@ -22,6 +22,7 @@ import logging
 import sqlite3
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 
 from html_parser import parse_weekly_overview
@@ -217,7 +218,7 @@ def trigger_desktop(report_nr):
     for day, task, hours in rows:
         entries.setdefault(day, []).append({"task": task, "hours": hours})
 
-    local_json = f"/tmp/form_fill_{report_nr}.json"
+    local_json = str(Path(tempfile.gettempdir()) / f"form_fill_{report_nr}.json")
     remote_json = f"C:/Users/adria/Documents/Berichtsheft/shared/form_fill_{report_nr}.json"
 
     with open(local_json, "w") as f:
